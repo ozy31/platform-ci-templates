@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Keeps SHA-pinned actions current; Dependabot updates the SHA and the
+  # trailing `# vX.Y.Z` comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: gomod
+    directory: /demo
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: docker
+    directory: /demo
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps

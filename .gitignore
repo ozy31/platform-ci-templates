@@ -1,0 +1,28 @@
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Go
+/demo/demo
+coverage.out
+*.test
+
+# Build and scan outputs
+dist/
+*.tgz
+image.tar
+*.sarif
+.trivycache/
+
+# Terraform
+.terraform/
+*.tfplan
+tfplan
+plan.txt
+
+# Local secrets
+.env
+*.pem
+.web-identity-token
