@@ -1,0 +1,29 @@
+# Example: .github/workflows/terraform.yml in an infrastructure repository.
+#
+# - PRs touching infra/prod get a plan comment.
+# - Merges to main apply the reviewed plan after approval on the
+#   `production` environment (Settings -> Environments -> Required reviewers).
+name: terraform
+
+on:
+  pull_request:
+    paths: ["infra/prod/**"]
+  push:
+    branches: [main]
+    paths: ["infra/prod/**"]
+
+permissions: {}
+
+jobs:
+  prod:
+    uses: ozy31/platform-ci-templates/.github/workflows/terraform-plan-apply.yml@v1.0.0
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    with:
+      working-directory: infra/prod
+      plan-role-arn: arn:aws:iam::123456789012:role/gha-terraform-plan
+      apply-role-arn: arn:aws:iam::123456789012:role/gha-terraform-apply
+      environment: production
+      init-args: -backend-config=backend.hcl

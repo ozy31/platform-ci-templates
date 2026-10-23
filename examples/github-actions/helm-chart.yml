@@ -1,0 +1,23 @@
+# Example: publish a Helm chart to ECR (OCI) when a `chart-v*` tag is pushed.
+name: helm-chart
+
+on:
+  pull_request:
+    paths: ["chart/**"]
+  push:
+    tags: ["chart-v*"]
+
+permissions: {}
+
+jobs:
+  chart:
+    uses: ozy31/platform-ci-templates/.github/workflows/helm-release.yml@v1.0.0
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      chart-path: chart
+      push: ${{ startsWith(github.ref, 'refs/tags/chart-v') }}
+      chart-version: ${{ startsWith(github.ref, 'refs/tags/chart-v') && github.ref_name || '' }}
+      registry: 123456789012.dkr.ecr.eu-central-1.amazonaws.com/charts
+      aws-role-arn: arn:aws:iam::123456789012:role/gha-helm-push

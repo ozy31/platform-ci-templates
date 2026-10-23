@@ -1,0 +1,97 @@
+# Dogfooding: this repository's own CI runs the reusable workflows against
+# the demo service in ./demo.
+#
+# Works with zero secrets configured:
+#   * pull requests and pushes: lint, test, security scans, image build + scan,
+#     Helm lint + package.
+#   * pushes to main only *push* the image when the repository variable
+#     AWS_ROLE_ARN is set (optionally AWS_REGION), via OIDC.
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: self-test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint workflows & templates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      # Module checksums are verified against sum.golang.org.
+      # shellcheck is preinstalled on GitHub-hosted Ubuntu runners and is
+      # picked up by actionlint automatically.
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color .github/workflows/*.yml examples/github-actions/*.yml
+
+      - name: Validate YAML of non-GitHub templates
+        run: |
+          set -euo pipefail
+          find bitbucket gitlab examples jenkins -type f \( -name '*.yml' -o -name '*.yaml' \) -print0 \
+            | while IFS= read -r -d '' f; do
+                yq 'true' "$f" > /dev/null
+                echo "ok  $f"
+              done
+
+  go:
+    name: Go CI
+    uses: ./.github/workflows/go-service-ci.yml
+    permissions:
+      contents: read
+    with:
+      working-directory: demo
+      coverage-min: 30
+
+  security:
+    name: Security scan
+    uses: ./.github/workflows/security-scan.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  image:
+    name: Container image
+    needs: go
+    uses: ./.github/workflows/docker-build-push.yml
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+      actions: read
+    with:
+      image-name: platform-ci-templates/demo
+      context: demo
+      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_ROLE_ARN != '' }}
+      aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+      aws-region: ${{ vars.AWS_REGION || 'eu-central-1' }}
+
+  helm:
+    name: Helm chart
+    uses: ./.github/workflows/helm-release.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      chart-path: demo/chart
+      chart-version: 0.1.0-ci.${{ github.run_number }}
+      app-version: ${{ github.sha }}

@@ -1,0 +1,66 @@
+# Example: .github/workflows/ci.yml in a Go service repository.
+#
+#   PR   -> test, security scan, image build + scan (nothing pushed)
+#   main -> same, then push + sign to ECR, then open a GitOps PR for staging
+#
+# Pin the templates to a release tag or, better, a full commit SHA
+# (Dependabot keeps both up to date).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    uses: ozy31/platform-ci-templates/.github/workflows/go-service-ci.yml@v1.0.0
+    permissions:
+      contents: read
+    with:
+      coverage-min: 70
+
+  security:
+    uses: ozy31/platform-ci-templates/.github/workflows/security-scan.yml@v1.0.0
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  image:
+    needs: [test, security]
+    uses: ozy31/platform-ci-templates/.github/workflows/docker-build-push.yml@v1.0.0
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+      actions: read
+    with:
+      image-name: team/payments-api
+      push: ${{ github.event_name == 'push' }}
+      aws-role-arn: arn:aws:iam::123456789012:role/gha-payments-api-ecr-push
+      aws-region: eu-central-1
+
+  promote-staging:
+    if: github.event_name == 'push'
+    needs: image
+    uses: ozy31/platform-ci-templates/.github/workflows/gitops-promote.yml@v1.0.0
+    permissions:
+      contents: read
+    with:
+      gitops-repository: example-org/gitops
+      values-file: apps/payments-api/staging/values.yaml
+      app-name: payments-api
+      environment: staging
+      image-tag: ${{ needs.image.outputs.sha-tag }}
+      image-digest: ${{ needs.image.outputs.digest }}
+      auto-merge: true
+      app-client-id: ${{ vars.GITOPS_APP_CLIENT_ID }}
+    secrets:
+      app-private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}

@@ -1,0 +1,31 @@
+# Example: .github/workflows/ci.yml in a Node.js service repository.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  test:
+    uses: ozy31/platform-ci-templates/.github/workflows/node-service-ci.yml@v1.0.0
+    permissions:
+      contents: read
+    with:
+      node-version: "24"
+
+  image:
+    needs: test
+    uses: ozy31/platform-ci-templates/.github/workflows/docker-build-push.yml@v1.0.0
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+      actions: read
+    with:
+      image-name: team/web-frontend
+      platforms: linux/amd64
+      push: ${{ github.event_name == 'push' }}
+      aws-role-arn: ${{ vars.ECR_PUSH_ROLE_ARN }}
