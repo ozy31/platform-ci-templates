@@ -1,0 +1,106 @@
+# Agent pod for containerPipeline. The Kubernetes plugin adds the `jnlp`
+# container automatically. All containers run as non-root with read-only
+# root filesystems; writable paths are emptyDir volumes.
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app.kubernetes.io/name: jenkins-agent
+    app.kubernetes.io/component: container-build
+spec:
+  # Bound to an IAM role through IRSA or EKS Pod Identity (ECR push only).
+  serviceAccountName: jenkins-build
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: golang
+      image: golang:1.26
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - { name: HOME, value: /tmp }
+        - { name: GOPATH, value: /tmp/go }
+        - { name: GOCACHE, value: /tmp/go-build }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: 500m, memory: 1Gi }
+        limits: { cpu: "2", memory: 2Gi }
+      volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+
+    # Rootless BuildKit: no Docker socket, no privileged container.
+    - name: buildkit
+      image: moby/buildkit:v0.34.1-rootless
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - name: BUILDKITD_FLAGS
+          value: --oci-worker-no-process-sandbox
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        # Rootless BuildKit needs to create user namespaces, which the
+        # default seccomp/AppArmor profiles block.
+        seccompProfile:
+          type: Unconfined
+        appArmorProfile:
+          type: Unconfined
+      resources:
+        requests: { cpu: "1", memory: 2Gi }
+        limits: { cpu: "4", memory: 4Gi }
+      volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+        - { name: buildkit-state, mountPath: /home/user/.local/share/buildkit }
+        - { name: buildkit-run, mountPath: /run/user/1000 }
+
+    - name: trivy
+      image: aquasec/trivy:0.70.0
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - { name: HOME, value: /tmp }
+        - { name: TRIVY_CACHE_DIR, value: /tmp/trivy }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: 250m, memory: 512Mi }
+        limits: { cpu: "1", memory: 1Gi }
+      volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+
+    - name: awscli
+      image: amazon/aws-cli:2.38.5
+      command: ["sleep"]
+      args: ["infinity"]
+      env:
+        - { name: HOME, value: /tmp }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: 100m, memory: 128Mi }
+        limits: { cpu: 500m, memory: 256Mi }
+      volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+
+  volumes:
+    - { name: tmp, emptyDir: {} }
+    - { name: buildkit-state, emptyDir: {} }
+    - { name: buildkit-run, emptyDir: {} }

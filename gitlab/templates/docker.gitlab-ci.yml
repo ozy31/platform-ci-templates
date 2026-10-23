@@ -1,0 +1,79 @@
+# Container build, push to Amazon ECR via GitLab OIDC, keyless cosign signing.
+#
+#   .docker:build  builds once and saves the image as an artifact (image.tar)
+#   .docker:push   loads the scanned tarball, pushes to ECR, signs the digest
+#
+# Variables:
+#   DOCKER_CONTEXT   build context (default ".")
+#   ECR_REGISTRY     <account>.dkr.ecr.<region>.amazonaws.com
+#   IMAGE_NAME       ECR repository, e.g. team/payments-api
+#   AWS_ROLE_ARN     role trusted for this project's OIDC `sub` claim
+#   AWS_REGION
+
+.docker:dind:
+  image: docker:29.9.2
+  services:
+    - name: docker:29.9.2-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: /certs/client
+
+# Exchange the job's OIDC token for short-lived AWS credentials.
+.aws:oidc:
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: sts.amazonaws.com
+  before_script:
+    - export AWS_WEB_IDENTITY_TOKEN_FILE="$(mktemp)"
+    - echo "$AWS_ID_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+    - export AWS_ROLE_SESSION_NAME="gl-${CI_PROJECT_ID}-${CI_JOB_ID}"
+
+.docker:build:
+  extends:
+    - .docker:dind
+    - .rules:mr-and-default-branch
+  stage: build
+  variables:
+    DOCKER_CONTEXT: "."
+  script:
+    - >-
+      docker build
+      --build-arg "VERSION=sha-${CI_COMMIT_SHORT_SHA}"
+      --label "org.opencontainers.image.source=${CI_PROJECT_URL}"
+      --label "org.opencontainers.image.revision=${CI_COMMIT_SHA}"
+      -t "app:${CI_COMMIT_SHORT_SHA}" "$DOCKER_CONTEXT"
+    - docker save "app:${CI_COMMIT_SHORT_SHA}" -o image.tar
+  artifacts:
+    expire_in: 1 day
+    paths: [image.tar]
+
+.docker:push:
+  extends:
+    - .docker:dind
+    - .rules:default-branch
+  stage: publish
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: sts.amazonaws.com
+    SIGSTORE_ID_TOKEN: # picked up by cosign for keyless signing
+      aud: sigstore
+  before_script:
+    - !reference [.aws:oidc, before_script]
+    - apk add --no-cache aws-cli cosign
+  script:
+    - docker load -i image.tar
+    - export IMAGE="${ECR_REGISTRY}/${IMAGE_NAME}"
+    - export TAG="sha-${CI_COMMIT_SHORT_SHA}"
+    - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+    - docker tag "app:${CI_COMMIT_SHORT_SHA}" "${IMAGE}:${TAG}"
+    - docker push "${IMAGE}:${TAG}"
+    - export IMAGE_REF="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${TAG}")"
+    - cosign sign --yes "$IMAGE_REF"
+    - echo "IMAGE_TAG=${TAG}" >> image.env
+    - echo "IMAGE_REF=${IMAGE_REF}" >> image.env
+  artifacts:
+    reports:
+      dotenv: image.env

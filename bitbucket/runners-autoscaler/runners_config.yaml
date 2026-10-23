@@ -1,0 +1,23 @@
+# Configuration for Atlassian's runners-autoscaler (bitbucketpipelines/runners-autoscaler).
+# Mounted into the autoscaler Deployment as a ConfigMap. Schema as of the 3.x
+# releases; check the upstream repository before upgrading.
+constants:
+  default_sleep_time_runner_setup: 10 # seconds between runner creations
+  default_sleep_time_runner_delete: 5 # seconds between runner deletions
+  runner_api_polling_interval: 60 # how often Bitbucket is polled for runner state
+  runner_cool_down_period: 300 # minimum idle time before a runner may be removed
+
+groups:
+  - name: linux-autoscaled
+    workspace: my-workspace # workspace slug or {uuid}
+    labels:
+      - autoscaled # matches `runs-on: [self.hosted, linux, autoscaled]`
+    namespace: bitbucket-runners
+    strategy: percentageRunnersIdle
+    parameters:
+      min: 2 # warm pool so the first build of the day does not wait
+      max: 20 # hard ceiling: protects the cluster and the bill
+      scale_up_threshold: 0.5 # scale up when >50% of runners are busy
+      scale_down_threshold: 0.2 # scale down when <20% are busy
+      scale_up_multiplier: 1.5
+      scale_down_multiplier: 0.5

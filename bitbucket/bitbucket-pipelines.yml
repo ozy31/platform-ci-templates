@@ -1,0 +1,172 @@
+# Bitbucket Pipelines equivalent of the GitHub Actions templates.
+# Copy to the root of a service repository as `bitbucket-pipelines.yml`.
+#
+# Required repository/workspace variables:
+#   AWS_REGION            e.g. eu-central-1
+#   AWS_OIDC_ROLE_ARN     IAM role trusted for the Bitbucket OIDC provider
+#   ECR_REGISTRY          <account>.dkr.ecr.<region>.amazonaws.com
+#   IMAGE_NAME            ECR repository, e.g. team/payments-api
+#   GITOPS_REPO           workspace/gitops-repo-slug
+#   GITOPS_TOKEN          (secured) repository access token of the GitOps repo,
+#                         scopes: repository:write, pullrequest:write
+#
+# Steps run on self-hosted, autoscaled Linux runners on Kubernetes
+# (see ./README.md). Drop `runs-on` to use Atlassian cloud runners.
+
+image: atlassian/default-image:5
+
+options:
+  max-time: 30
+
+clone:
+  depth: 50
+
+definitions:
+  caches:
+    gomod: /root/go/pkg/mod
+    gobuild: /root/.cache/go-build
+
+  services:
+    docker:
+      memory: 3072
+
+  # Step templates. YAML anchors keep the pipelines below DRY.
+  steps:
+    - step: &test
+        name: Go test
+        runs-on: [self.hosted, linux, autoscaled]
+        image: golang:1.26
+        caches: [gomod, gobuild]
+        script:
+          - test -z "$(gofmt -l .)" || { gofmt -l .; echo "gofmt needed"; exit 1; }
+          - go vet ./...
+          - go test -race -coverprofile=coverage.out ./...
+          - go tool cover -func=coverage.out | tail -1
+
+    - step: &secrets-scan
+        name: Secret scan (gitleaks)
+        runs-on: [self.hosted, linux, autoscaled]
+        image: zricethezav/gitleaks:v8.30.1
+        clone:
+          depth: full
+        script:
+          - gitleaks git . --redact --no-banner --exit-code 1
+
+    - step: &iac-scan
+        name: IaC scan (trivy config)
+        runs-on: [self.hosted, linux, autoscaled]
+        image: aquasec/trivy:0.70.0
+        script:
+          - trivy config --severity CRITICAL,HIGH --exit-code 1 .
+
+    - step: &build
+        name: Build image
+        runs-on: [self.hosted, linux, autoscaled]
+        services: [docker]
+        caches: [docker]
+        script:
+          - export IMAGE_TAG="sha-${BITBUCKET_COMMIT:0:7}"
+          - export DOCKER_BUILDKIT=1
+          - docker build --build-arg "VERSION=$IMAGE_TAG" -t "app:$IMAGE_TAG" .
+          - docker save "app:$IMAGE_TAG" -o image.tar
+        artifacts:
+          - image.tar
+
+    - step: &image-scan
+        name: Image scan (trivy)
+        runs-on: [self.hosted, linux, autoscaled]
+        image: aquasec/trivy:0.70.0
+        script:
+          - trivy image --input image.tar --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1
+
+    - step: &push
+        name: Push to ECR (OIDC)
+        runs-on: [self.hosted, linux, autoscaled]
+        oidc: true
+        services: [docker]
+        script:
+          # Exchange the step's OIDC token for short-lived AWS credentials.
+          # No static AWS keys are stored in Bitbucket.
+          - export AWS_WEB_IDENTITY_TOKEN_FILE="$BITBUCKET_CLONE_DIR/.web-identity-token"
+          - export AWS_ROLE_ARN="$AWS_OIDC_ROLE_ARN"
+          - export AWS_ROLE_SESSION_NAME="bb-${BITBUCKET_REPO_SLUG}-${BITBUCKET_BUILD_NUMBER}"
+          - echo "$BITBUCKET_STEP_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+          - export IMAGE_TAG="sha-${BITBUCKET_COMMIT:0:7}"
+          - docker load -i image.tar
+          # Run the AWS CLI as a container so the build image needs no extra tooling.
+          - >-
+            docker run --rm
+            -e AWS_REGION -e AWS_ROLE_ARN -e AWS_ROLE_SESSION_NAME
+            -e AWS_WEB_IDENTITY_TOKEN_FILE=/token
+            -v "$AWS_WEB_IDENTITY_TOKEN_FILE:/token:ro"
+            amazon/aws-cli:2.38.5 ecr get-login-password
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          - docker tag "app:$IMAGE_TAG" "$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+          - docker push "$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+        after-script:
+          - rm -f "$BITBUCKET_CLONE_DIR/.web-identity-token"
+
+    - step: &promote
+        name: GitOps promote
+        runs-on: [self.hosted, linux, autoscaled]
+        script:
+          - export IMAGE_TAG="sha-${BITBUCKET_COMMIT:0:7}"
+          - export ENVIRONMENT="$BITBUCKET_DEPLOYMENT_ENVIRONMENT"
+          - export VALUES_FILE="apps/${BITBUCKET_REPO_SLUG}/${ENVIRONMENT}/values.yaml"
+          - export BRANCH="promote/${BITBUCKET_REPO_SLUG}/${ENVIRONMENT}/${IMAGE_TAG}"
+          # yq, checksum-verified.
+          - curl -fsSLo /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64
+          - echo "8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f  /usr/local/bin/yq" | sha256sum -c -
+          - chmod +x /usr/local/bin/yq
+          - git clone --depth 1 "https://x-token-auth:${GITOPS_TOKEN}@bitbucket.org/${GITOPS_REPO}.git" gitops
+          - cd gitops
+          - yq -i '.image.tag = strenv(IMAGE_TAG)' "$VALUES_FILE"
+          - git checkout -b "$BRANCH"
+          - git -c user.name="Bitbucket Pipelines" -c user.email="pipelines@noreply.invalid" commit -am "chore(${BITBUCKET_REPO_SLUG}): promote ${IMAGE_TAG} to ${ENVIRONMENT}"
+          - git push origin "$BRANCH"
+          - >-
+            yq -n -o json '
+              .title = "Promote " + strenv(BITBUCKET_REPO_SLUG) + " " + strenv(IMAGE_TAG) + " to " + strenv(ENVIRONMENT) |
+              .source.branch.name = strenv(BRANCH) |
+              .destination.branch.name = "main" |
+              .close_source_branch = true |
+              .description = "Automated promotion from " + strenv(BITBUCKET_REPO_FULL_NAME) + " commit " + strenv(BITBUCKET_COMMIT)'
+            > pr.json
+          - >-
+            curl -fsS -X POST
+            -H "Authorization: Bearer ${GITOPS_TOKEN}"
+            -H "Content-Type: application/json"
+            --data @pr.json
+            "https://api.bitbucket.org/2.0/repositories/${GITOPS_REPO}/pullrequests"
+
+pipelines:
+  pull-requests:
+    "**":
+      - parallel:
+          fail-fast: true
+          steps:
+            - step: *test
+            - step: *secrets-scan
+            - step: *iac-scan
+      - step: *build
+      - step: *image-scan
+
+  branches:
+    main:
+      - parallel:
+          steps:
+            - step: *test
+            - step: *secrets-scan
+            - step: *iac-scan
+      - step: *build
+      - step: *image-scan
+      - step: *push
+      - step:
+          <<: *promote
+          name: Promote to staging
+          deployment: staging
+      - step:
+          <<: *promote
+          name: Promote to production
+          deployment: production
+          trigger: manual

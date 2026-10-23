@@ -1,0 +1,65 @@
+# Example `.gitlab-ci.yml` for a service repository consuming the shared templates.
+# Pin `ref` to a release tag (or commit SHA), never a moving branch.
+
+include:
+  - project: platform/ci-templates
+    ref: v1.0.0
+    file:
+      - /gitlab/templates/rules.gitlab-ci.yml
+      - /gitlab/templates/go.gitlab-ci.yml
+      - /gitlab/templates/security.gitlab-ci.yml
+      - /gitlab/templates/docker.gitlab-ci.yml
+      - /gitlab/templates/gitops.gitlab-ci.yml
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never # avoid duplicate branch + MR pipelines
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages: [test, build, scan, publish, promote]
+
+variables:
+  AWS_REGION: eu-central-1
+  ECR_REGISTRY: 123456789012.dkr.ecr.eu-central-1.amazonaws.com
+  IMAGE_NAME: team/payments-api
+  AWS_ROLE_ARN: arn:aws:iam::123456789012:role/gitlab-payments-api-ecr-push
+  GITOPS_PROJECT: platform/gitops
+
+test:
+  extends: .go:test
+
+gitleaks:
+  extends: .security:gitleaks
+
+iac:
+  extends: .security:trivy-config
+
+build:
+  extends: .docker:build
+
+scan:
+  extends: .security:trivy-image
+  needs: [build]
+
+publish:
+  extends: .docker:push
+  needs: [build, scan, test, gitleaks, iac]
+
+promote:staging:
+  extends: .gitops:promote
+  needs: [publish]
+  rules: !reference [.rules:default-branch, rules]
+  variables:
+    PROMOTE_ENV: staging
+    VALUES_FILE: apps/payments-api/staging/values.yaml
+
+promote:production:
+  extends: .gitops:promote
+  needs: [publish, "promote:staging"]
+  rules: !reference [.rules:default-branch-manual, rules]
+  variables:
+    PROMOTE_ENV: production
+    VALUES_FILE: apps/payments-api/production/values.yaml

@@ -1,0 +1,17 @@
+# Shared `rules:` building blocks. Reference them with `extends:` or
+# `!reference [.rules:<name>, rules]`.
+
+.rules:mr-and-default-branch:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.rules:default-branch:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.rules:default-branch-manual:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false # blocks later stages until someone approves

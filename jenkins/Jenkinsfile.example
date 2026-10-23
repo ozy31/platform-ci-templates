@@ -1,0 +1,14 @@
+// Jenkinsfile of a service repository. The shared library is configured in
+// Jenkins (Manage Jenkins -> System -> Global Trusted Pipeline Libraries) as
+// `platform-ci-templates`, pointing at this repository with the library root
+// set to `jenkins/`.
+@Library('platform-ci-templates@v1.0.0') _
+
+containerPipeline(
+    imageName:    'team/payments-api',
+    ecrRegistry:  '123456789012.dkr.ecr.eu-central-1.amazonaws.com',
+    awsRegion:    'eu-central-1',
+    pushBranches: ['main'],
+    gitopsRepo:   'https://github.com/example-org/gitops.git',
+    gitopsValues: 'apps/payments-api/staging/values.yaml',
+)

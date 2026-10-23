@@ -1,0 +1,60 @@
+# Security scanning jobs. Use with `extends: .security:gitleaks` etc.
+
+.security:gitleaks:
+  image:
+    name: zricethezav/gitleaks:v8.30.1
+    entrypoint: [""]
+  stage: test
+  extends: .rules:mr-and-default-branch
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - |
+      if [ -n "$CI_MERGE_REQUEST_DIFF_BASE_SHA" ]; then
+        # Merge request: only the commits it introduces.
+        gitleaks git . --redact --no-banner --exit-code 1 \
+          --log-opts="${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}"
+      else
+        gitleaks git . --redact --no-banner --exit-code 1
+      fi
+
+.security:trivy-config:
+  image:
+    name: aquasec/trivy:0.70.0
+    entrypoint: [""]
+  stage: test
+  extends: .rules:mr-and-default-branch
+  variables:
+    TRIVY_SEVERITY: CRITICAL,HIGH
+    TRIVY_CACHE_DIR: .trivycache/
+  cache:
+    key: trivy
+    paths: [.trivycache/]
+  script:
+    - trivy config --exit-code 1 .
+
+# Scans the image tarball produced by `.docker:build` before anything is pushed.
+.security:trivy-image:
+  image:
+    name: aquasec/trivy:0.70.0
+    entrypoint: [""]
+  stage: scan
+  extends: .rules:mr-and-default-branch
+  variables:
+    TRIVY_SEVERITY: CRITICAL,HIGH
+    TRIVY_CACHE_DIR: .trivycache/
+  cache:
+    key: trivy
+    paths: [.trivycache/]
+  script:
+    # Report for the merge request security widget (all severities)...
+    - >-
+      trivy image --input image.tar --exit-code 0 --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+      --format template --template "@/contrib/gitlab.tpl"
+      --output gl-container-scanning-report.json
+    # ...and the gate.
+    - trivy image --input image.tar --exit-code 1 --ignore-unfixed --skip-db-update
+  artifacts:
+    when: always
+    reports:
+      container_scanning: gl-container-scanning-report.json

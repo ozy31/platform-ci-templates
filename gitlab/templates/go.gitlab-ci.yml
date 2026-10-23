@@ -1,0 +1,30 @@
+# Go service CI. Use with: `extends: .go:test`.
+#
+# Variables:
+#   GO_DIR   directory containing go.mod (default ".")
+
+.go:test:
+  image: golang:1.26
+  stage: test
+  extends: .rules:mr-and-default-branch
+  variables:
+    GO_DIR: "."
+    GOPATH: $CI_PROJECT_DIR/.go
+    GOCACHE: $CI_PROJECT_DIR/.go-build
+  cache:
+    key:
+      files: [go.mod]
+      prefix: go-$CI_JOB_NAME_SLUG
+    paths: [.go/pkg/mod, .go-build]
+  script:
+    - cd "$GO_DIR"
+    - go mod verify
+    - test -z "$(gofmt -l .)" || { gofmt -l .; echo "gofmt needed"; exit 1; }
+    - go vet ./...
+    - go test -race -coverprofile=coverage.out -covermode=atomic ./...
+    - go tool cover -func=coverage.out | tail -1
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths: [$GO_DIR/coverage.out]
