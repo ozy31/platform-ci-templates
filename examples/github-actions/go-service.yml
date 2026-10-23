@@ -30,6 +30,7 @@ jobs:
     uses: ozy31/platform-ci-templates/.github/workflows/security-scan.yml@v1.0.0
     permissions:
       contents: read
+      id-token: write # requested by the optional trivy-image job; GitHub validates it even when skipped
       security-events: write
       actions: read
 
