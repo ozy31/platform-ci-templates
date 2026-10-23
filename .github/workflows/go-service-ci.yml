@@ -1,0 +1,112 @@
+# Reusable workflow: CI for a Go service - formatting, vet, golangci-lint,
+# race-enabled tests with coverage, and a build check.
+#
+# Caller permissions required: contents: read
+name: go-service-ci
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing go.mod.
+        type: string
+        default: "."
+      golangci-lint-version:
+        description: golangci-lint version (v2.x). Empty skips linting.
+        type: string
+        default: v2.15
+      race:
+        description: Run tests with the race detector.
+        type: boolean
+        default: true
+      coverage-min:
+        description: Minimum total statement coverage in percent (0 disables the gate).
+        type: number
+        default: 0
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+
+permissions: {}
+
+concurrency:
+  group: go-ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.working-directory }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Go lint & test
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Locate dependency file
+        id: deps
+        env:
+          DIR: ${{ inputs.working-directory }}
+        working-directory: .
+        run: |
+          # Modules without dependencies have no go.sum; fall back to go.mod
+          # so the module cache key is still well defined.
+          if [[ -f "$DIR/go.sum" ]]; then f="$DIR/go.sum"; else f="$DIR/go.mod"; fi
+          echo "file=$f" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.working-directory }}/go.mod
+          cache-dependency-path: ${{ steps.deps.outputs.file }}
+
+      - name: Verify modules
+        run: |
+          go mod verify
+          go mod tidy -diff
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::These files are not gofmt-ed:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        if: inputs.golangci-lint-version != ''
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ inputs.golangci-lint-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: go test
+        env:
+          RACE: ${{ inputs.race }}
+        run: |
+          flags=(-coverprofile=coverage.out -covermode=atomic)
+          if [[ "$RACE" == "true" ]]; then flags+=(-race); fi
+          go test "${flags[@]}" ./...
+
+      - name: Coverage
+        env:
+          MIN: ${{ inputs.coverage-min }}
+        run: |
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%","",$3); print $3}')"
+          echo "### Go coverage: ${total}%" >> "$GITHUB_STEP_SUMMARY"
+          if awk -v t="$total" -v m="$MIN" 'BEGIN { exit !(t < m) }'; then
+            echo "::error::Coverage ${total}% is below the ${MIN}% minimum."
+            exit 1
+          fi
+
+      - name: go build
+        run: go build -trimpath ./...

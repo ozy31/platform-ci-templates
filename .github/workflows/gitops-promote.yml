@@ -1,0 +1,211 @@
+# Reusable workflow: promote a new image to an environment the GitOps way.
+#
+# Instead of running `kubectl`/`helm upgrade` from CI (which needs cluster
+# credentials in CI and bypasses review), this workflow edits the image tag
+# (and optionally digest) in a values file of a separate GitOps repository
+# and opens a pull request. Argo CD watches that repository and syncs the
+# change once it is merged, so every deployment is a reviewed, revertable
+# git commit.
+#
+# Authentication to the GitOps repository, in order of preference:
+#   1. A GitHub App (input `app-client-id` + secret `app-private-key`):
+#      short-lived token, scoped to the GitOps repository only.
+#   2. A fine-grained PAT (secret `token`) with contents + pull-requests write.
+#
+# Caller permissions required: contents: read
+name: gitops-promote
+
+on:
+  workflow_call:
+    inputs:
+      gitops-repository:
+        description: GitOps repository as `owner/name`.
+        type: string
+        required: true
+      values-file:
+        description: Values file to edit, relative to the GitOps repository root, e.g. `apps/payments/overlays/staging/values.yaml`.
+        type: string
+        required: true
+      app-name:
+        description: Application name used in the branch name and PR title.
+        type: string
+        required: true
+      environment:
+        description: Target environment, e.g. `staging`.
+        type: string
+        required: true
+      image-tag:
+        description: New image tag.
+        type: string
+        required: true
+      image-digest:
+        description: New image digest (`sha256:...`). Recommended; written to `digest-path` when set.
+        type: string
+        default: ""
+      tag-path:
+        description: yq path of the tag field.
+        type: string
+        default: .image.tag
+      digest-path:
+        description: yq path of the digest field.
+        type: string
+        default: .image.digest
+      base-branch:
+        description: Branch of the GitOps repository to target.
+        type: string
+        default: main
+      labels:
+        description: Comma-separated PR labels.
+        type: string
+        default: gitops,promotion
+      auto-merge:
+        description: Enable auto-merge on the PR (lower environments only; branch protection still applies).
+        type: boolean
+        default: false
+      app-client-id:
+        description: GitHub App client ID used to mint a token for the GitOps repository.
+        type: string
+        default: ""
+    secrets:
+      app-private-key:
+        description: Private key of the GitHub App (with `app-client-id`).
+        required: false
+      token:
+        description: Fallback fine-grained PAT if no GitHub App is used.
+        required: false
+    outputs:
+      pull-request-url:
+        description: URL of the created/updated promotion PR.
+        value: ${{ jobs.promote.outputs.pull-request-url }}
+
+permissions: {}
+
+concurrency:
+  # One promotion PR per app/environment at a time; newer images win.
+  group: gitops-promote-${{ inputs.gitops-repository }}-${{ inputs.app-name }}-${{ inputs.environment }}
+  cancel-in-progress: true
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.app-name }} to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      pull-request-url: ${{ steps.pr.outputs.pull-request-url }}
+    steps:
+      - name: Split repository
+        id: repo
+        env:
+          REPO: ${{ inputs.gitops-repository }}
+        run: |
+          echo "owner=${REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${REPO#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint GitHub App token
+        id: app-token
+        if: inputs.app-client-id != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Select token
+        id: token
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PAT: ${{ secrets.token }}
+        run: |
+          if [[ -z "${APP_TOKEN}" && -z "${PAT}" ]]; then
+            echo "::error::Provide either 'app-client-id' + 'app-private-key' or a 'token' secret."
+            exit 1
+          fi
+          echo "source=$([[ -n "${APP_TOKEN}" ]] && echo app || echo pat)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.gitops-repository }}
+          ref: ${{ inputs.base-branch }}
+          token: ${{ steps.token.outputs.source == 'app' && steps.app-token.outputs.token || secrets.token }}
+          path: gitops
+          persist-credentials: false
+
+      - name: Bump image
+        id: bump
+        working-directory: gitops
+        env:
+          VALUES_FILE: ${{ inputs.values-file }}
+          TAG_PATH: ${{ inputs.tag-path }}
+          DIGEST_PATH: ${{ inputs.digest-path }}
+          NEW_TAG: ${{ inputs.image-tag }}
+          NEW_DIGEST: ${{ inputs.image-digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$VALUES_FILE" ]]; then
+            echo "::error::$VALUES_FILE not found in the GitOps repository."
+            exit 1
+          fi
+          old_tag="$(yq "${TAG_PATH}" "$VALUES_FILE")"
+          echo "old-tag=${old_tag}" >> "$GITHUB_OUTPUT"
+          expr="${TAG_PATH} = strenv(NEW_TAG)"
+          if [[ -n "$NEW_DIGEST" ]]; then
+            expr="${expr} | ${DIGEST_PATH} = strenv(NEW_DIGEST)"
+          fi
+          # yq (mikefarah v4, preinstalled on GitHub-hosted Ubuntu runners)
+          # keeps comments but drops blank lines. Apply only the semantic
+          # change as a patch so the promotion PR diff is just the tag lines.
+          tmp="$(mktemp)"
+          yq "$expr" "$VALUES_FILE" > "$tmp"
+          diff -U0 -w -b --ignore-blank-lines "$VALUES_FILE" "$tmp" > "$tmp.patch" || true
+          patch --quiet "$VALUES_FILE" < "$tmp.patch"
+          rm -f "$tmp" "$tmp.patch"
+          git --no-pager diff
+
+      - name: Open promotion PR
+        id: pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          path: gitops
+          token: ${{ steps.token.outputs.source == 'app' && steps.app-token.outputs.token || secrets.token }}
+          base: ${{ inputs.base-branch }}
+          branch: promote/${{ inputs.app-name }}/${{ inputs.environment }}
+          delete-branch: true
+          sign-commits: ${{ steps.token.outputs.source == 'app' }}
+          add-paths: ${{ inputs.values-file }}
+          commit-message: "chore(${{ inputs.app-name }}): promote ${{ inputs.image-tag }} to ${{ inputs.environment }}"
+          title: "Promote ${{ inputs.app-name }} ${{ inputs.image-tag }} to ${{ inputs.environment }}"
+          labels: ${{ inputs.labels }}
+          body: |
+            Automated promotion from `${{ github.repository }}`.
+
+            | | |
+            |---|---|
+            | Application | `${{ inputs.app-name }}` |
+            | Environment | `${{ inputs.environment }}` |
+            | Tag | `${{ steps.bump.outputs.old-tag }}` -> `${{ inputs.image-tag }}` |
+            | Digest | `${{ inputs.image-digest || 'n/a' }}` |
+            | Source commit | ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }} |
+            | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+
+            Argo CD syncs this change after merge. Revert this PR to roll back.
+
+      - name: Enable auto-merge
+        if: inputs.auto-merge && steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.source == 'app' && steps.app-token.outputs.token || secrets.token }}
+          PR_URL: ${{ steps.pr.outputs.pull-request-url }}
+        run: gh pr merge --auto --squash "$PR_URL"
+
+      - name: Job summary
+        if: steps.pr.outputs.pull-request-url != ''
+        env:
+          PR_URL: ${{ steps.pr.outputs.pull-request-url }}
+          OP: ${{ steps.pr.outputs.pull-request-operation }}
+        run: |
+          echo "Promotion PR ${OP}: ${PR_URL}" >> "$GITHUB_STEP_SUMMARY"

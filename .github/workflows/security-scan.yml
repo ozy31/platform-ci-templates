@@ -1,0 +1,238 @@
+# Reusable workflow: repository security scanning.
+#
+#   * trivy-fs     - dependency vulnerabilities (lockfiles, go.mod, ...)
+#   * trivy-iac    - misconfigurations in Dockerfiles, Kubernetes, Helm, Terraform
+#   * gitleaks     - committed secrets (only the PR's commits on pull requests)
+#   * trivy-image  - an already-published image (optional, ECR via OIDC)
+#
+# Results are uploaded to GitHub code scanning as SARIF so findings show up
+# inline on pull requests.
+#
+# Caller permissions required:
+#   contents: read, security-events: write, actions: read
+#   (+ id-token: write when scanning a private ECR image)
+name: security-scan
+
+on:
+  workflow_call:
+    inputs:
+      scan-path:
+        description: Directory to scan for dependencies and IaC.
+        type: string
+        default: "."
+      severity:
+        description: Severities that fail the job.
+        type: string
+        default: CRITICAL,HIGH
+      fs:
+        description: Run the Trivy filesystem (dependency) scan.
+        type: boolean
+        default: true
+      iac:
+        description: Run the Trivy IaC / misconfiguration scan.
+        type: boolean
+        default: true
+      secrets:
+        description: Run gitleaks secret detection.
+        type: boolean
+        default: true
+      image-ref:
+        description: Optional image reference to scan, e.g. `<acct>.dkr.ecr.<region>.amazonaws.com/app@sha256:...`.
+        type: string
+        default: ""
+      aws-role-arn:
+        description: Role to assume for pulling `image-ref` from private ECR.
+        type: string
+        default: ""
+      aws-region:
+        description: AWS region for ECR.
+        type: string
+        default: eu-central-1
+      skip-dirs:
+        description: Comma-separated directories excluded from Trivy scans.
+        type: string
+        default: ""
+      upload-sarif:
+        description: Upload results to GitHub code scanning.
+        type: boolean
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+
+permissions: {}
+
+concurrency:
+  group: security-scan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Bump together. Checksum from gitleaks_<ver>_checksums.txt of the release.
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  # SARIF upload is skipped for fork PRs, which only get a read-only token.
+  CAN_UPLOAD: ${{ inputs.upload-sarif && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+
+jobs:
+  trivy-fs:
+    name: Dependencies (trivy fs)
+    if: inputs.fs
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.scan-path }}
+          scanners: vuln
+          skip-dirs: ${{ inputs.skip-dirs }}
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: "true"
+          format: sarif
+          output: trivy-fs.sarif
+          limit-severities-for-sarif: "true"
+          exit-code: "1"
+
+      - name: Upload SARIF
+        if: always() && env.CAN_UPLOAD == 'true' && hashFiles('trivy-fs.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  trivy-iac:
+    name: IaC misconfigurations (trivy config)
+    if: inputs.iac
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.scan-path }}
+          skip-dirs: ${{ inputs.skip-dirs }}
+          severity: ${{ inputs.severity }}
+          format: sarif
+          output: trivy-iac.sarif
+          limit-severities-for-sarif: "true"
+          exit-code: "1"
+
+      - name: Upload SARIF
+        if: always() && env.CAN_UPLOAD == 'true' && hashFiles('trivy-iac.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-iac.sarif
+          category: trivy-iac
+
+  gitleaks:
+    name: Secrets (gitleaks)
+    if: inputs.secrets
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The CLI is used directly (checksum-verified) instead of the gitleaks
+      # GitHub Action, which needs a paid licence for organisation repos.
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Scan git history
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          log_opts=()
+          if [[ -n "${BASE_SHA}" ]]; then
+            # Pull request: only the commits it introduces.
+            log_opts=(--log-opts="${BASE_SHA}..${HEAD_SHA}")
+          fi
+          gitleaks git . "${log_opts[@]}" \
+            --redact \
+            --no-banner \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            --exit-code 1
+
+      - name: Upload SARIF
+        if: always() && env.CAN_UPLOAD == 'true' && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  trivy-image:
+    name: Published image (trivy image)
+    if: inputs.image-ref != ''
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+      actions: read
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        if: inputs.aws-role-arn != ''
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-session-name: gha-scan-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to Amazon ECR
+        if: inputs.aws-role-arn != ''
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ inputs.image-ref }}
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: "true"
+          format: sarif
+          output: trivy-image.sarif
+          limit-severities-for-sarif: "true"
+          exit-code: "1"
+
+      - name: Upload SARIF
+        if: always() && env.CAN_UPLOAD == 'true' && hashFiles('trivy-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image

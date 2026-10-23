@@ -1,0 +1,277 @@
+# Reusable workflow: build a container image, scan it before it leaves the
+# runner, then (optionally) push a multi-arch image to Amazon ECR using GitHub
+# OIDC, attach SBOM + SLSA provenance attestations and sign it keylessly with
+# cosign.
+#
+# Flow:
+#   1. Build a single-arch image and load it into the local Docker daemon.
+#   2. Scan it with Trivy (fails the job on findings at/above `scan-severity`).
+#   3. If `push` is true: assume an AWS role via OIDC, rebuild for all
+#      `platforms` (warm cache), push with SBOM + provenance, sign the digest.
+#
+# Caller permissions required:
+#   contents: read, id-token: write, security-events: write, actions: read
+name: docker-build-push
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: ECR repository name, e.g. `team/payments-api`.
+        type: string
+        required: true
+      context:
+        description: Docker build context directory.
+        type: string
+        default: "."
+      dockerfile:
+        description: Path to the Dockerfile. Defaults to `<context>/Dockerfile`.
+        type: string
+        default: ""
+      platforms:
+        description: Target platforms for the pushed image.
+        type: string
+        default: linux/amd64,linux/arm64
+      build-args:
+        description: Extra build args, one `KEY=value` per line. `VERSION` is always set.
+        type: string
+        default: ""
+      tag-rules:
+        description: docker/metadata-action `tags` rules.
+        type: string
+        default: |
+          type=sha,format=short,prefix=sha-
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+      push:
+        description: Push, attest and sign the image. Leave false for PRs.
+        type: boolean
+        default: false
+      aws-role-arn:
+        description: IAM role assumed through GitHub OIDC (required when `push` is true).
+        type: string
+        default: ""
+      aws-region:
+        description: AWS region of the ECR registry.
+        type: string
+        default: eu-central-1
+      scan:
+        description: Run a Trivy vulnerability scan on the built image.
+        type: boolean
+        default: true
+      scan-severity:
+        description: Severities that fail the build.
+        type: string
+        default: CRITICAL,HIGH
+      upload-sarif:
+        description: Upload scan results to GitHub code scanning.
+        type: boolean
+        default: true
+      sign:
+        description: Sign the pushed image digest with cosign (keyless, Sigstore).
+        type: boolean
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+    outputs:
+      image:
+        description: Fully qualified image name (without tag).
+        value: ${{ jobs.build.outputs.image }}
+      digest:
+        description: Digest of the pushed manifest list (empty when not pushed).
+        value: ${{ jobs.build.outputs.digest }}
+      version:
+        description: Primary version computed by docker/metadata-action.
+        value: ${{ jobs.build.outputs.version }}
+      sha-tag:
+        description: Immutable `sha-<7 chars>` tag, the one to promote via GitOps.
+        value: ${{ jobs.build.outputs.sha-tag }}
+
+permissions: {}
+
+concurrency:
+  group: docker-build-push-${{ github.workflow }}-${{ github.ref }}-${{ inputs.image-name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build${{ inputs.push && ', push & sign' || ' & scan' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write # OIDC to AWS + keyless cosign signing
+      security-events: write # SARIF upload
+      actions: read # required by upload-sarif on private repos
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+      sha-tag: ${{ steps.ref.outputs.sha-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          PUSH: ${{ inputs.push }}
+          ROLE: ${{ inputs.aws-role-arn }}
+        run: |
+          if [[ "$PUSH" == "true" && -z "$ROLE" ]]; then
+            echo "::error::'push' is true but 'aws-role-arn' is empty. Static AWS keys are not supported by design."
+            exit 1
+          fi
+
+      - name: Set up QEMU
+        if: inputs.push
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Configure AWS credentials (OIDC)
+        if: inputs.push
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ inputs.aws-region }}
+          # Account IDs are not secrets; masking them would blank the image output.
+          mask-aws-account-id: false
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        if: inputs.push
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Resolve image reference
+        id: ref
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          registry="${REGISTRY:-local}"
+          {
+            echo "image=${registry}/${IMAGE_NAME}"
+            echo "dockerfile=${DOCKERFILE:-${CONTEXT}/Dockerfile}"
+            echo "sha-tag=sha-${GITHUB_SHA::7}"
+            # Cache/category-safe slug of the image name.
+            echo "slug=${IMAGE_NAME//\//-}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.ref.outputs.image }}
+          tags: ${{ inputs.tag-rules }}
+
+      - name: Build (single-arch, for scanning)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ steps.ref.outputs.dockerfile }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ steps.ref.outputs.image }}:scan-${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            ${{ inputs.build-args }}
+          cache-from: type=gha,scope=${{ steps.ref.outputs.slug }}
+          cache-to: type=gha,mode=max,scope=${{ steps.ref.outputs.slug }}
+
+      - name: Trivy image scan
+        if: inputs.scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.ref.outputs.image }}:scan-${{ github.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: ${{ inputs.scan-severity }}
+          limit-severities-for-sarif: "true"
+          ignore-unfixed: "true"
+          exit-code: "1"
+
+      - name: Upload image scan results
+        # Fork PRs get a read-only token; skip upload there instead of failing.
+        if: >-
+          always() && inputs.scan && inputs.upload-sarif &&
+          hashFiles('trivy-image.sarif') != '' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image-${{ steps.ref.outputs.slug }}
+
+      - name: Build and push (multi-arch, SBOM + provenance)
+        id: push
+        if: inputs.push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ steps.ref.outputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            ${{ inputs.build-args }}
+          cache-from: type=gha,scope=${{ steps.ref.outputs.slug }}
+          cache-to: type=gha,mode=max,scope=${{ steps.ref.outputs.slug }}
+
+      - name: Install cosign
+        if: inputs.push && inputs.sign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image (keyless)
+        if: inputs.push && inputs.sign
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          # The Fulcio certificate binds the signature to this workflow's
+          # identity (job_workflow_ref), so consumers can require that images
+          # were produced by this exact template.
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Job summary
+        if: always()
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          PUSHED: ${{ inputs.push }}
+        run: |
+          {
+            echo "### Container image"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${IMAGE}\` |"
+            echo "| Pushed | ${PUSHED} |"
+            echo "| Digest | \`${DIGEST:-n/a}\` |"
+            echo ""
+            echo "<details><summary>Tags</summary>"
+            echo ""
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

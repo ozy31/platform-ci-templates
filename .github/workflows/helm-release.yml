@@ -1,0 +1,165 @@
+# Reusable workflow: lint, render, package and (optionally) push a Helm chart
+# to an OCI registry on Amazon ECR, authenticating with GitHub OIDC.
+#
+# ECR expects a repository named `<registry path>/<chart name>` to exist,
+# e.g. registry `123456789012.dkr.ecr.eu-central-1.amazonaws.com/charts`
+# and chart `demo` -> ECR repository `charts/demo`.
+#
+# Caller permissions required:
+#   contents: read, id-token: write
+name: helm-release
+
+on:
+  workflow_call:
+    inputs:
+      chart-path:
+        description: Path to the chart directory.
+        type: string
+        required: true
+      chart-version:
+        description: Override the chart `version`; a non-numeric prefix such as `v` or `chart-v` is stripped. Empty keeps Chart.yaml.
+        type: string
+        default: ""
+      app-version:
+        description: Override the chart `appVersion`. Empty keeps Chart.yaml.
+        type: string
+        default: ""
+      values-files:
+        description: Extra values files (one per line) to lint/render the chart with.
+        type: string
+        default: ""
+      push:
+        description: Push the packaged chart to `registry`.
+        type: boolean
+        default: false
+      registry:
+        description: OCI registry path without scheme, e.g. `<acct>.dkr.ecr.<region>.amazonaws.com/charts`.
+        type: string
+        default: ""
+      aws-role-arn:
+        description: IAM role assumed through OIDC for pushing to ECR.
+        type: string
+        default: ""
+      aws-region:
+        description: AWS region of the registry.
+        type: string
+        default: eu-central-1
+      helm-version:
+        description: Helm CLI version.
+        type: string
+        default: v4.3.1
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+    outputs:
+      chart-ref:
+        description: Pushed chart reference `oci://<registry>/<name>:<version>` (empty if not pushed).
+        value: ${{ jobs.release.outputs.chart-ref }}
+
+permissions: {}
+
+concurrency:
+  group: helm-release-${{ github.workflow }}-${{ github.ref }}-${{ inputs.chart-path }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  release:
+    name: Helm ${{ inputs.push && 'package & push' || 'lint & package' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      chart-ref: ${{ steps.push.outputs.chart-ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          PUSH: ${{ inputs.push }}
+          REGISTRY: ${{ inputs.registry }}
+          ROLE: ${{ inputs.aws-role-arn }}
+        run: |
+          if [[ "$PUSH" == "true" && ( -z "$REGISTRY" || -z "$ROLE" ) ]]; then
+            echo "::error::'push' requires both 'registry' and 'aws-role-arn'."
+            exit 1
+          fi
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ inputs.helm-version }}
+
+      - name: Build dependencies
+        env:
+          CHART: ${{ inputs.chart-path }}
+        run: |
+          if grep -q '^dependencies:' "$CHART/Chart.yaml"; then
+            helm dependency build "$CHART"
+          fi
+
+      - name: Lint and render
+        env:
+          CHART: ${{ inputs.chart-path }}
+          VALUES_FILES: ${{ inputs.values-files }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r f; do
+            if [[ -n "$f" ]]; then args+=(--values "$f"); fi
+          done <<< "$VALUES_FILES"
+          helm lint --strict "$CHART" "${args[@]}"
+          helm template ci-render "$CHART" "${args[@]}" > /dev/null
+
+      - name: Package
+        id: package
+        env:
+          CHART: ${{ inputs.chart-path }}
+          CHART_VERSION: ${{ inputs.chart-version }}
+          APP_VERSION: ${{ inputs.app-version }}
+        run: |
+          set -euo pipefail
+          args=(--destination "$RUNNER_TEMP/dist")
+          if [[ -n "$CHART_VERSION" ]]; then
+            # Accept git tags such as `v1.2.3` or `chart-v1.2.3`.
+            args+=(--version "$(sed -E 's/^[^0-9]*//' <<< "$CHART_VERSION")")
+          fi
+          if [[ -n "$APP_VERSION" ]]; then
+            args+=(--app-version "$APP_VERSION")
+          fi
+          helm package "$CHART" "${args[@]}"
+          pkg="$(ls "$RUNNER_TEMP"/dist/*.tgz)"
+          echo "package=$pkg" >> "$GITHUB_OUTPUT"
+          echo "Packaged \`$(basename "$pkg")\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure AWS credentials (OIDC)
+        if: inputs.push
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-session-name: gha-helm-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+          mask-aws-account-id: false
+
+      - name: Push to OCI registry
+        id: push
+        if: inputs.push
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PACKAGE: ${{ steps.package.outputs.package }}
+          AWS_REGION: ${{ inputs.aws-region }}
+        run: |
+          set -euo pipefail
+          host="${REGISTRY%%/*}"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$host"
+          helm push "$PACKAGE" "oci://${REGISTRY}"
+          name="$(helm show chart "$PACKAGE" | yq -r '.name')"
+          version="$(helm show chart "$PACKAGE" | yq -r '.version')"
+          ref="oci://${REGISTRY}/${name}:${version}"
+          echo "chart-ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Pushed \`$ref\`" >> "$GITHUB_STEP_SUMMARY"
+          helm registry logout "$host"
