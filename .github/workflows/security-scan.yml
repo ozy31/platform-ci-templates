@@ -105,7 +105,7 @@ jobs:
 
       - name: Upload SARIF
         if: always() && env.CAN_UPLOAD == 'true' && hashFiles('trivy-fs.sarif') != ''
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
@@ -138,7 +138,7 @@ jobs:
 
       - name: Upload SARIF
         if: always() && env.CAN_UPLOAD == 'true' && hashFiles('trivy-iac.sarif') != ''
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           sarif_file: trivy-iac.sarif
           category: trivy-iac
@@ -190,7 +190,7 @@ jobs:
 
       - name: Upload SARIF
         if: always() && env.CAN_UPLOAD == 'true' && hashFiles('gitleaks.sarif') != ''
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           sarif_file: gitleaks.sarif
           category: gitleaks
@@ -216,7 +216,7 @@ jobs:
 
       - name: Log in to Amazon ECR
         if: inputs.aws-role-arn != ''
-        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
 
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -232,7 +232,7 @@ jobs:
 
       - name: Upload SARIF
         if: always() && env.CAN_UPLOAD == 'true' && hashFiles('trivy-image.sarif') != ''
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
